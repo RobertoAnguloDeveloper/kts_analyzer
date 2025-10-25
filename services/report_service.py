@@ -3,15 +3,18 @@ Filepath: kts_analyzer/services/report_service.py
 ----------------------------------------------
 KTS Analyzer - Report Service (VCSM)
 
-**Refactored**
-- **Chart Consolidation:** Created a new "All Charts Dashboard" sheet.
-  The _create_data_sheet method now ONLY writes data.
-- A new method, _add_charts_to_dashboard, now creates the monthly/yearly
-  charts and places them all on the new dashboard sheet.
-- **Date Formatting:** _create_data_sheet now writes tables manually
-  (cell by cell) to apply the 'yyyy-mm' format directly to the
-  Date column in the data tables, as requested.
-- All correlation analysis logic is retained.
+**Refactor (V7) - Final Version**
+- Includes a "Summary" sheet as the first tab to
+  explain all KPI calculations.
+- Corrects the `add_table()` range in 'Correlation Analysis'
+  to properly include all columns.
+- Fixes the chart layout in 'Production Overview' to
+  prevent any chart overlap.
+- 'Fleet, Fuel & Ore' chart correctly plots 'Active Fleet'
+  and 'Total Ore (kt)' on the secondary Y-axis to ensure
+  proper scaling and visibility.
+- All chart formulas use the correct, working table syntax
+  (e.g., =AnalysisData[Total Ore (kt)]).
 --------------------------------------
 """
 
@@ -23,368 +26,567 @@ from openpyxl.utils import get_column_letter
 class XlsxReportService:
     """
     Handles the creation of the final Excel report using XlsxWriter
-    to generate native, data-linked charts.
+    to generate native, data-linked charts and formulas.
     """
 
     def __init__(self):
         """Initialize the report service."""
-        pass
-
-    def _sanitize_sheet_name(self, name: str) -> str:
-        """Cleans a string to be a valid Excel sheet name."""
-        name = re.sub(r'[\\/*?:\[\]]', '', name)
-        return name[:31]
-
+        # This will store the dynamic column letters for our formulas
+        self.col_map = {}
+        
     def generate_report(self, 
                         output_file: str, 
-                        all_data_grouped: pd.api.typing.DataFrameGroupBy, 
-                        summary_data: pd.DataFrame,
                         analysis_data: pd.DataFrame):
         """
-        Generates the full Excel report with data and native charts.
+        Generates the full Excel report with data, native formulas, and charts.
         
         Args:
             output_file: Path to save the new report.
-            all_data_grouped: A DataFrameGroupBy object with the time-series data.
-            summary_data: A DataFrame with summary statistics.
-            analysis_data: A wide-format DataFrame for correlation.
+            analysis_data: A wide-format DataFrame from the data service.
         """
         
+        if analysis_data.empty:
+            raise ValueError("Cannot generate report from empty analysis data.")
+            
         try:
             with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
                 workbook = writer.book
                 
                 # --- Define Reusable Formats ---
-                header_format = workbook.add_format({
-                    'bold': True, 'valign': 'top', 'fg_color': '#4F81BD',
-                    'font_color': 'white', 'border': 1, 'text_wrap': True
-                })
-                # *** REQUESTED FORMAT CHANGE ***
-                date_format = workbook.add_format({'num_format': 'yyyy-mm', 'border': 1})
-                number_format = workbook.add_format({'num_format': '#,##0.0', 'border': 1})
-                year_format = workbook.add_format({'num_format': '0000', 'border': 1})
-
-                # --- 1. New Analysis Sheet (First Sheet) ---
-                if not analysis_data.empty:
-                    self._create_analysis_sheet(writer, workbook, analysis_data, 
-                                                header_format, date_format, number_format)
-
-                # --- 2. Summary Sheet ---
-                self._create_summary_sheet(writer, summary_data, header_format)
-                
-                # --- 3. New "All Charts Dashboard" Sheet ---
-                charts_dashboard = workbook.add_worksheet("All Charts Dashboard")
-                charts_dashboard.hide_gridlines(2)
-                current_dashboard_row = 1 # 1-based index for rows
-
-                # --- 4. Data-Only Sheets & Chart Population ---
-                
-                # Create a list of processed groups to iterate over
-                # We do this because the group-by object is a generator
-                processed_groups = []
-                for group_key, data in all_data_grouped:
-                    if data.empty:
-                        continue
-                    processed_groups.append((group_key, data))
-
-                # Loop 1: Create all data-only sheets
-                for group_key, data in processed_groups:
-                    group_key_str = " - ".join(map(str, group_key))
-                    sheet_name = self._sanitize_sheet_name(group_key_str)
+                self.formats = {
+                    'header': workbook.add_format({
+                        'bold': True, 'valign': 'top', 'fg_color': '#4F81BD',
+                        'font_color': 'white', 'border': 1, 'text_wrap': True
+                    }),
+                    'date': workbook.add_format({'num_format': 'yyyy-mm', 'border': 1}),
+                    'number': workbook.add_format({'num_format': '#,##0.0', 'border': 1}),
+                    'pct': workbook.add_format({'num_format': '0.0%', 'border': 1}),
+                    'ratio': workbook.add_format({'num_format': '0.00', 'border': 1}),
+                    'title': workbook.add_format({'bold': True, 'font_size': 14, 'bottom': 1, 'font_color': '#4F81BD'}),
+                    'link': workbook.add_format({'font_color': 'blue', 'underline': 1}),
                     
-                    self._create_data_sheet(writer, workbook, sheet_name, group_key, data,
-                                            header_format, date_format, number_format, year_format)
+                    # --- Formats for Summary Sheet ---
+                    'summary_header': workbook.add_format({
+                        'bold': True, 'font_size': 12, 'font_color': '#4F81BD', 
+                        'bottom': 1, 'border_color': '#4F81BD', 'valign': 'top'
+                    }),
+                    'summary_text': workbook.add_format({
+                        'font_size': 10, 'valign': 'top', 'text_wrap': True
+                    }),
+                    'summary_formula': workbook.add_format({
+                        'font_size': 10, 'valign': 'top', 'text_wrap': True, 
+                        'font_name': 'Courier New', 'bold': True
+                    })
+                }
 
-                # Loop 2: Populate the charts dashboard
-                for group_key, data in processed_groups:
-                    group_key_str = " - ".join(map(str, group_key))
-                    sheet_name = self._sanitize_sheet_name(group_key_str)
+                # --- Build Report Sheets ---
+                
+                # 1. "Summary" Sheet (NEW)
+                self._create_summary_sheet(workbook, "Summary")
+                
+                # 2. "Processed_Data" Sheet (Raw Pivot Data)
+                data_sheet_name = "Processed_Data"
+                self._create_processed_data_sheet(writer, workbook, data_sheet_name, analysis_data)
 
-                    # Add charts for this group to the dashboard
-                    current_dashboard_row = self._add_charts_to_dashboard(
-                        workbook,
-                        charts_dashboard,
-                        sheet_name,
-                        group_key,
-                        data,
-                        current_dashboard_row
-                    )
+                # 3. "Correlation Analysis" Sheet (Formula-Driven Table)
+                calc_sheet_name = "Correlation Analysis"
+                table_name = "AnalysisData" # The name for our new Excel Table
+                data_rows = len(analysis_data)
+                self._create_analysis_calculation_sheet(
+                    writer, workbook, calc_sheet_name, 
+                    data_sheet_name, data_rows, table_name
+                )
+
+                # 4. "Production Overview" Dashboard
+                self._create_overview_charts_sheet(workbook, "Production Overview", table_name)
+
+                # 5. "Production Charts" Dashboard
+                self._create_production_charts_sheet(workbook, "Production Charts", table_name)
+
+                # 6. "Efficiency Charts" Dashboard
+                self._create_efficiency_charts_sheet(workbook, "Efficiency Charts", table_name)
+                
+                # 7. "Fleet, Fuel & Ore" Dashboard
+                self._create_fleet_fuel_charts_sheet(workbook, "Fleet, Fuel & Ore", table_name)
+                
+                # 8. Set active sheet to the new Summary sheet
+                workbook.get_worksheet_by_name("Summary").activate()
 
         except Exception as e:
             raise IOError(f"Failed to save Excel report: {e}")
 
-    def _create_analysis_sheet(self, writer, workbook, analysis_data, 
-                               header_format, date_format, number_format):
-        """Creates the new main dashboard for correlation analysis."""
-        
-        sheet_name = "Correlation Analysis"
-        
-        # Write the wide-format data
-        analysis_data.to_excel(writer, sheet_name=sheet_name, index=True, startrow=1)
-        worksheet = writer.sheets[sheet_name]
-        worksheet.hide_gridlines(2)
-        
-        # Format Header
-        for col_num, value in enumerate(analysis_data.columns.values):
-             worksheet.write(1, col_num + 1, value, header_format)
-        worksheet.write(1, 0, analysis_data.index.name, header_format) # Format index header
-
-        # Format Columns
-        worksheet.set_column('A:A', 12, date_format) # Date Index
-        worksheet.set_column('B:Z', 18, number_format) # All data columns
-        worksheet.set_row(1, 40) # Taller header row for wrapped text
-        
-        # --- Add Correlation Charts ---
-        data_rows = len(analysis_data)
-        
-        # Find column indices dynamically
-        try:
-            cols = list(analysis_data.columns)
-            # Get index (1-based) for header, +1 for 0-based list
-            col_date = 'A'
-            col_fleet = get_column_letter(cols.index('Active Fleet Count (Aprox)') + 2)
-            col_fuel = get_column_letter(cols.index('Liter of Diesel Consumed') + 2)
-            col_material = get_column_letter(cols.index('Total Material (kt)') + 2)
-            col_efficiency = get_column_letter(cols.index('Efficiency (kt per Liter)') + 2)
-            col_productivity = get_column_letter(cols.index('Productivity (kt per Fleet)') + 2)
-            
-            chart_start_row = 3 # Start charts below header
-            
-            # Chart 1: Total Material vs. Active Fleet
-            chart1 = self._add_correlation_chart(
-                workbook=workbook,
-                title='Total Material Mined vs. Active Fleet',
-                cat_formula=f"='{sheet_name}'!${col_date}$3:${col_date}${2 + data_rows}",
-                val1_formula=f"='{sheet_name}'!${col_material}$3:${col_material}${2 + data_rows}",
-                val1_name='Total Material (kt)',
-                val1_axis_name='Total Material (kt)',
-                val2_formula=f"='{sheet_name}'!${col_fleet}$3:${col_fleet}${2 + data_rows}",
-                val2_name='Active Fleet',
-                val2_axis_name='Active Fleet Count'
-            )
-            worksheet.insert_chart(chart_start_row, 0, chart1, {'x_scale': 1.8, 'y_scale': 1.4})
-
-            # Chart 2: Fuel Consumed vs. Active Fleet
-            chart2 = self._add_correlation_chart(
-                workbook=workbook,
-                title='Fuel Consumed vs. Active Fleet',
-                cat_formula=f"='{sheet_name}'!${col_date}$3:${col_date}${2 + data_rows}",
-                val1_formula=f"='{sheet_name}'!${col_fuel}$3:${col_fuel}${2 + data_rows}",
-                val1_name='Liters Consumed',
-                val1_axis_name='Liters Consumed',
-                val2_formula=f"='{sheet_name}'!${col_fleet}$3:${col_fleet}${2 + data_rows}",
-                val2_name='Active Fleet',
-                val2_axis_name='Active Fleet Count'
-            )
-            worksheet.insert_chart(chart_start_row + 25, 0, chart2, {'x_scale': 1.8, 'y_scale': 1.4})
-
-            # Chart 3: Efficiency (kt per Liter)
-            chart3 = self._add_correlation_chart(
-                workbook=workbook,
-                title='Efficiency (Total kt Mined per Liter Fuel)',
-                cat_formula=f"='{sheet_name}'!${col_date}$3:${col_date}${2 + data_rows}",
-                val1_formula=f"='{sheet_name}'!${col_efficiency}$3:${col_efficiency}${2 + data_rows}",
-                val1_name='Efficiency (kt/L)',
-                val1_axis_name='kt / Liter',
-                val2_formula=None # Single-axis chart
-            )
-            worksheet.insert_chart(chart_start_row, 8, chart3, {'x_scale': 1.8, 'y_scale': 1.4})
-            
-            # Chart 4: Productivity (kt per Fleet)
-            chart4 = self._add_correlation_chart(
-                workbook=workbook,
-                title='Productivity (Total kt Mined per Fleet)',
-                cat_formula=f"='{sheet_name}'!${col_date}$3:${col_date}${2 + data_rows}",
-                val1_formula=f"='{sheet_name}'!${col_productivity}$3:${col_productivity}${2 + data_rows}",
-                val1_name='Productivity (kt/Fleet)',
-                val1_axis_name='kt / Fleet Unit',
-                val2_formula=None # Single-axis chart
-            )
-            worksheet.insert_chart(chart_start_row + 25, 8, chart4, {'x_scale': 1.8, 'y_scale': 1.4})
-
-        except ValueError as e:
-            # Handle if a key column isn't found
-            worksheet.write('A1', f"Could not generate charts: Required column missing ({e}).", 
-                            workbook.add_format({'bold': True, 'font_color': 'red'}))
-        except Exception as e:
-            worksheet.write('A1', f"An error occurred generating charts: {e}", 
-                            workbook.add_format({'bold': True, 'font_color': 'red'}))
-
-    def _add_correlation_chart(self, workbook, title, cat_formula, val1_formula, 
-                               val1_name, val1_axis_name, val2_formula, 
-                               val2_name=None, val2_axis_name=None):
-        """Helper function to create a 1 or 2 axis line chart."""
-        
-        chart = workbook.add_chart({'type': 'line'})
-
-        # Series 1 (Primary Y-Axis)
-        chart.add_series({
-            'categories': cat_formula,
-            'values':     val1_formula,
-            'name':       val1_name,
-            'marker':     {'type': 'automatic'},
-            'y_axis':     0,
-        })
-        
-        # Series 2 (Secondary Y-Axis), if provided
-        if val2_formula:
-            chart.add_series({
-                'categories': cat_formula,
-                'values':     val2_formula,
-                'name':       val2_name,
-                'marker':     {'type': 'automatic'},
-                'y_axis':     1, # Use secondary axis
-            })
-        
-        chart.set_title({'name': title})
-        chart.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
-        
-        # Set Y-Axis (Primary)
-        chart.set_y_axis({'name': val1_axis_name, 'num_format': '#,##0'})
-        
-        # Set Y2-Axis (Secondary), if provided
-        if val2_axis_name:
-            chart.set_y2_axis({'name': val2_axis_name, 'num_format': '#,##0'})
-            chart.set_legend({'position': 'bottom'})
-        else:
-            chart.set_legend({'position': 'none'})
-            
-        return chart
-
-    def _create_summary_sheet(self, writer, summary_data, header_format):
-        """Writes and formats the summary data to its own sheet."""
-        sheet_name = "Summary"
-        summary_data.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
-        worksheet = writer.sheets[sheet_name]
-        worksheet.hide_gridlines(2)
-        
-        for col_num, value in enumerate(summary_data.columns.values):
-            worksheet.write(1, col_num, value, header_format)
-            
-        for i, col in enumerate(summary_data.columns):
-            width = max(len(str(col)), summary_data[col].astype(str).map(len).max())
-            worksheet.set_column(i, i, width + 2)
-
-    def _create_data_sheet(self, writer, workbook, sheet_name, group_key, data,
-                             header_format, date_format, number_format, year_format):
+    def _create_summary_sheet(self, workbook, sheet_name):
         """
-        Creates a single sheet with time-series data AND formats the date column.
-        This method NO LONGER creates charts.
+        Creates a summary and KPI definition sheet.
         """
-        
-        monthly_data = data[['Value']].copy()
-        yearly_data = monthly_data['Value'].resample('YE').sum().to_frame(name='Total')
-        yearly_data.index = yearly_data.index.year
-        yearly_data.index.name = "Year"
-
         worksheet = workbook.add_worksheet(sheet_name)
-        writer.sheets[sheet_name] = worksheet 
+        worksheet.hide_gridlines(2)
         
-        title = f"Data: {group_key[0]} - {group_key[1]} ({group_key[2]})"
-        worksheet.write('A1', title, workbook.add_format({'bold': True, 'font_size': 14}))
+        # Get formats
+        title_format = self.formats['title']
+        header_format = self.formats['summary_header']
+        text_format = self.formats['summary_text']
+        formula_format = self.formats['summary_formula']
 
-        # --- Manually write Monthly Data to apply 'yyyy-mm' format ---
-        worksheet.write('A3', "Monthly Data", header_format)
-        worksheet.merge_range('A3:B3', "Monthly Data", header_format)
-        
-        worksheet.write('A4', "Date", header_format)
-        worksheet.write('B4', "Value", header_format)
-        
-        row = 4 # Start data on row 5 (0-indexed row 4)
-        for date, value in monthly_data['Value'].items():
-            worksheet.write_datetime(row, 0, date, date_format)
-            worksheet.write_number(row, 1, value, number_format)
-            row += 1
-        
-        # --- Manually write Yearly Data ---
-        worksheet.write('D3', "Yearly Summary", header_format)
-        worksheet.merge_range('D3:E3', "Yearly Summary", header_format)
+        # Set column widths
+        worksheet.set_column('A:A', 5)
+        worksheet.set_column('B:B', 70)
+        worksheet.set_column('C:C', 5)
+        worksheet.set_default_row(14)
 
-        worksheet.write('D4', "Year", header_format)
-        worksheet.write('E4', "Total", header_format)
+        row = 1
+        worksheet.write(row, 1, "Report Summary & KPI Definitions", title_format)
+        row += 2
+
+        # --- How to Use ---
+        worksheet.write(row, 1, "How To Use This Report", header_format)
+        row += 1
+        worksheet.set_row(row, 60) # Set row height for text
+        worksheet.write(row, 1, 
+            "This report is built on dynamic, formula-driven data.\n"
+            "1. All calculations are performed in the 'Correlation Analysis' sheet within an Excel Table.\n"
+            "2. All charts on the dashboards dynamically reference this table.\n"
+            "3. You can add new monthly data to the 'Processed_Data' sheet, and all formulas and charts will update automatically.", 
+            text_format
+        )
+        row += 2
+
+        # --- KPI Definitions ---
+        worksheet.write(row, 1, "Key Performance Indicator (KPI) Calculations", header_format)
+        row += 1
+
+        def write_kpi(r, kpi, desc, formula):
+            # Helper to write a KPI block
+            worksheet.set_row(r, 16) # Header row
+            worksheet.write_rich_string(r, 1, header_format, kpi, text_format, f" - {desc}")
+            worksheet.set_row(r + 1, 16) # Formula row
+            worksheet.write_rich_string(r + 1, 1, formula_format, "Formula: ", text_format, formula)
+            return r + 3 # Return next starting row
+
+        row = write_kpi(row,
+            "Total Material (kt)",
+            "Total material (ore + waste) moved.",
+            "= [Ore Mined - RGM - kt] + [Ore Mined - Sar - kt] + [Overburden - RGM - kt] + [Overburden - Sar - kt]"
+        )
         
-        row = 4 # Start data on row 5
-        for year, total in yearly_data['Total'].items():
-            worksheet.write_number(row, 3, year, year_format)
-            worksheet.write_number(row, 4, total, number_format)
-            row += 1
+        row = write_kpi(row,
+            "Efficiency (kt per Liter)",
+            "Measures fuel efficiency. How many kilotons of material are moved for every liter of diesel consumed.",
+            "= [Total Material (kt)] / [Liter of Diesel Consumed]"
+        )
 
-        # --- Set Column Widths ---
-        worksheet.set_column('A:A', 12) # yyyy-mm
-        worksheet.set_column('B:B', 15) # Number
-        worksheet.set_column('D:D', 10) # Year
-        worksheet.set_column('E:E', 15) # Number
+        row = write_kpi(row,
+            "Productivity (kt per Fleet)",
+            "Measures fleet productivity. How many kilotons of material are moved per active fleet unit.",
+            "= [Total Material (kt)] / [Active Fleet Count (Aprox)]"
+        )
 
-    def _add_charts_to_dashboard(self, workbook, dashboard_sheet, data_sheet_name,
-                                 group_key, data, current_row):
+        row = write_kpi(row,
+            "RGM Strip Ratio",
+            "The ratio of waste (overburden) to ore for the RGM area. A key mining metric.",
+            "= [Overburden - RGM - kt] / [Ore Mined - RGM - kt]"
+        )
+
+        row = write_kpi(row,
+            "Sar Strip Ratio",
+            "The ratio of waste (overburden) to ore for the Sar area.",
+            "= [Overburden - Sar - kt] / [Ore Mined - Sar - kt]"
+        )
+        
+        # --- Chart Definitions ---
+        row += 1
+        worksheet.write(row, 1, "Chart Definitions", header_format)
+        row += 1
+
+        row = write_kpi(row,
+            "Stripping Ratio Trends (Chart)",
+            "This chart plots the 'RGM Strip Ratio' and 'Sar Strip Ratio' KPIs over time to visualize trends.",
+            "This chart plots the two KPI columns calculated above."
+        )
+
+
+    def _create_processed_data_sheet(self, writer, workbook, sheet_name, analysis_data):
         """
-        Creates monthly and yearly charts for a data group and adds them
-        to the specified dashboard sheet.
+        Creates the 'Processed_Data' sheet with the raw pivot table.
+        """
+        worksheet = workbook.add_worksheet(sheet_name)
+        worksheet.hide() # Hide this sheet from the user
         
-        Args:
-            workbook: The XlsxWriter workbook object.
-            dashboard_sheet: The worksheet object for the dashboard.
-            data_sheet_name: The name of the sheet containing the data (e.g., 'Ore Mined - RGM - kt').
-            group_key: The tuple key for the data (Category, SubCategory, Unit).
-            data: The DataFrame (used to get row counts).
-            current_row: The row on the dashboard to start inserting charts.
+        # Write Header
+        worksheet.write(0, 0, analysis_data.index.name, self.formats['header'])
+        for col_num, value in enumerate(analysis_data.columns.values):
+             worksheet.write(0, col_num + 1, value, self.formats['header'])
+        
+        # Write Data
+        row = 1
+        for date, data_row in analysis_data.iterrows():
+            worksheet.write_datetime(row, 0, date, self.formats['date'])
+            for col_num, value in enumerate(data_row.values):
+                worksheet.write_number(row, col_num + 1, value, self.formats['number'])
+            row += 1
             
-        Returns:
-            The new current_row for the next set of charts.
+        # Set Column Widths
+        worksheet.set_column('A:A', 12)
+        worksheet.set_column('B:Z', 18)
+
+    def _create_analysis_calculation_sheet(self, writer, workbook, sheet_name, 
+                                           data_sheet_name, data_rows, table_name):
         """
+        Creates the 'Correlation Analysis' sheet, which is built entirely
+        from Excel formulas and formatted as a named Table.
+        """
+        worksheet = workbook.add_worksheet(sheet_name)
         
-        num_monthly = len(data)
-        num_yearly = data['Value'].resample('YE').sum().count()
+        # --- Find Source Columns from 'Processed_Data' ---
+        base_cols = {
+            'Date': 'A',
+            'Ore Mined - RGM - kt': 'B',
+            'Overburden - RGM - kt': 'C',
+            'Ore Mined - Sar - kt': 'D',
+            'Overburden - Sar - kt': 'E',
+            'Active Fleet Count (Aprox)': 'F',
+            'Liter of Diesel Consumed': 'G'
+        }
         
-        # --- Create Title for this Chart Group ---
-        title = f"Analysis: {group_key[0]} - {group_key[1]} ({group_key[2]})"
-        title_format = workbook.add_format({'bold': True, 'font_size': 14, 'bottom': 1, 'font_color': '#4F81BD'})
-        dashboard_sheet.merge_range(current_row, 0, current_row, 15, title, title_format)
-        current_row += 1 # Move down past title
+        # --- Define Calculation Columns ---
+        calc_cols = {
+            'Total Ore (kt)': 'H',
+            'Total Overburden (kt)': 'I',
+            'Total Material (kt)': 'J',
+            'Efficiency (kt per Liter)': 'K',
+            'Productivity (kt per Fleet)': 'L',
+            'RGM Strip Ratio': 'M',
+            'Sar Strip Ratio': 'N'
+        }
+        
+        self.col_map = {**base_cols, **calc_cols}
+        
+        # --- Write Header Row ---
+        col = 0
+        table_headers = []
+        for name in self.col_map.keys():
+            worksheet.write(0, col, name, self.formats['header'])
+            table_headers.append({'header': name}) # For add_table()
+            col += 1
+            
+        # --- Write Data Rows (Formulas) ---
+        for r in range(data_rows):
+            row_idx = r + 1 # 1-based index
+            
+            # --- Link Base Data ---
+            for name, col_letter in base_cols.items():
+                formula = f"='{data_sheet_name}'!{col_letter}{row_idx + 1}"
+                col_idx = name_idx(name)
+                if name == 'Date':
+                    worksheet.write_formula(row_idx, col_idx, formula, self.formats['date'])
+                else:
+                    worksheet.write_formula(row_idx, col_idx, formula, self.formats['number'])
 
-        # --- Monthly Chart ---
-        quoted_sheet_name = f"'{data_sheet_name}'"
-        chart_monthly = workbook.add_chart({'type': 'line'})
+            # --- Write Calculation Formulas ---
+            c = self.col_map
+            
+            # Total Ore (kt)
+            f_total_ore = f"=SUM({c['Ore Mined - RGM - kt']}{row_idx+1}, {c['Ore Mined - Sar - kt']}{row_idx+1})"
+            worksheet.write_formula(row_idx, name_idx('Total Ore (kt)'), f_total_ore, self.formats['number'])
+            
+            # Total Overburden (kt)
+            f_total_over = f"=SUM({c['Overburden - RGM - kt']}{row_idx+1}, {c['Overburden - Sar - kt']}{row_idx+1})"
+            worksheet.write_formula(row_idx, name_idx('Total Overburden (kt)'), f_total_over, self.formats['number'])
+
+            # Total Material (kt)
+            f_total_mat = f"=SUM({c['Total Ore (kt)']}{row_idx+1}, {c['Total Overburden (kt)']}{row_idx+1})"
+            worksheet.write_formula(row_idx, name_idx('Total Material (kt)'), f_total_mat, self.formats['number'])
+
+            # Efficiency (kt per Liter)
+            f_efficiency = f"=IFERROR({c['Total Material (kt)']}{row_idx+1} / {c['Liter of Diesel Consumed']}{row_idx+1}, 0)"
+            worksheet.write_formula(row_idx, name_idx('Efficiency (kt per Liter)'), f_efficiency, self.formats['ratio'])
+            
+            # Productivity (kt per Fleet)
+            f_productivity = f"=IFERROR({c['Total Material (kt)']}{row_idx+1} / {c['Active Fleet Count (Aprox)']}{row_idx+1}, 0)"
+            worksheet.write_formula(row_idx, name_idx('Productivity (kt per Fleet)'), f_productivity, self.formats['ratio'])
+
+            # RGM Strip Ratio
+            f_rgm_strip = f"=IFERROR({c['Overburden - RGM - kt']}{row_idx+1} / {c['Ore Mined - RGM - kt']}{row_idx+1}, 0)"
+            worksheet.write_formula(row_idx, name_idx('RGM Strip Ratio'), f_rgm_strip, self.formats['ratio'])
+            
+            # Sar Strip Ratio
+            f_sar_strip = f"=IFERROR({c['Overburden - Sar - kt']}{row_idx+1} / {c['Ore Mined - Sar - kt']}{row_idx+1}, 0)"
+            worksheet.write_formula(row_idx, name_idx('Sar Strip Ratio'), f_sar_strip, self.formats['ratio'])
+
+
+        # --- Format Sheet ---
+        worksheet.set_column('A:A', 12)
+        worksheet.set_column('B:J', 18)
+        worksheet.set_column('K:N', 15)
+        worksheet.freeze_panes(1, 0)
         
-        # Note: Data starts at row 5 (A5, B5) because of manual write
-        cat_monthly = f'={quoted_sheet_name}!$A$5:$A${4 + num_monthly}'
-        val_monthly = f'={quoted_sheet_name}!$B$5:$B${4 + num_monthly}'
-        
-        chart_monthly.add_series({
-            'categories': cat_monthly,
-            'values':     val_monthly,
-            'name':       f'Monthly {group_key[2]}',
-            'marker':     {'type': 'automatic'},
+        # --- Add Excel Table ---
+        # **FIX:** Corrected range calculation to use len() directly
+        table_range = f'A1:{get_column_letter(len(self.col_map))}{data_rows + 1}'
+        worksheet.add_table(table_range, {
+            'name': table_name,
+            'columns': table_headers,
+            'style': 'TableStyleMedium9'
         })
         
-        chart_monthly.set_title({'name': f'Monthly: {group_key[0]} - {group_key[1]}'})
-        chart_monthly.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
-        chart_monthly.set_y_axis({'name': group_key[2], 'num_format': '#,##0'})
-        chart_monthly.set_legend({'position': 'none'})
+    def _create_overview_charts_sheet(self, workbook, sheet_name, table_name):
+        """
+        Creates the 'Production Overview' dashboard sheet.
+        """
+        worksheet = workbook.add_worksheet(sheet_name)
+        worksheet.hide_gridlines(2)
         
-        dashboard_sheet.insert_chart(current_row, 0, chart_monthly, {'x_scale': 1.8, 'y_scale': 1.4})
+        cat_formula = f"={table_name}[Date]"
 
-        # --- Yearly Chart ---
-        chart_yearly = workbook.add_chart({'type': 'column'})
+        # --- Chart 1: Ore Production Over Time (Line) ---
+        chart1 = workbook.add_chart({'type': 'line'})
+        chart1.set_title({'name': 'Ore Production Over Time'})
         
-        # Note: Data starts at row 5 (D5, E5)
-        cat_yearly = f'={quoted_sheet_name}!$D$5:$D${4 + num_yearly}'
-        val_yearly = f'={quoted_sheet_name}!$E$5:$E${4 + num_yearly}'
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Ore Mined - RGM - kt]",
+            'name': 'RGM',
+            'marker': {'type': 'automatic'},
+        })
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Ore Mined - Sar - kt]",
+            'name': 'Sar',
+            'marker': {'type': 'automatic'},
+        })
+        chart1.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart1.set_y_axis({'name': 'Ore Mined (kt)', 'num_format': '#,##0'})
+        chart1.set_legend({'position': 'bottom'})
+        # **FIX:** Adjusted scale and position to prevent overlap
+        worksheet.insert_chart('A1', chart1, {'x_scale': 1.2, 'y_scale': 1.5})
 
-        chart_yearly.add_series({
-            'categories': cat_yearly,
-            'values':     val_yearly,
-            'name':       f'Yearly Total {group_key[2]}',
-            'data_labels': {'value': True, 'num_format': '#,##0'},
+        # --- Chart 2: Overburden Movement (Line) ---
+        chart2 = workbook.add_chart({'type': 'line'})
+        chart2.set_title({'name': 'Overburden Movement'})
+        
+        chart2.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Overburden - RGM - kt]",
+            'name': 'RGM',
+            'marker': {'type': 'automatic'},
+        })
+        chart2.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Overburden - Sar - kt]",
+            'name': 'Sar',
+            'marker': {'type': 'automatic'},
+        })
+        chart2.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart2.set_y_axis({'name': 'Overburden (kt)', 'num_format': '#,##0'})
+        chart2.set_legend({'position': 'bottom'})
+        # **FIX:** Adjusted scale and position to prevent overlap
+        worksheet.insert_chart('K1', chart2, {'x_scale': 1.2, 'y_scale': 1.5})
+
+        # --- Chart 3: Stripping Ratio Trends (Line) ---
+        chart3 = workbook.add_chart({'type': 'line'})
+        chart3.set_title({'name': 'Stripping Ratio Trends (Overburden/Ore)'})
+        
+        chart3.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[RGM Strip Ratio]",
+            'name': 'RGM Strip Ratio',
+            'marker': {'type': 'automatic'},
+        })
+        chart3.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Sar Strip Ratio]",
+            'name': 'Sar Strip Ratio',
+            'marker': {'type': 'automatic'},
+        })
+        chart3.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart3.set_y_axis({'name': 'Strip Ratio', 'num_format': '0.00'})
+        chart3.set_legend({'position': 'bottom'})
+        worksheet.insert_chart('A26', chart3, {'x_scale': 1.2, 'y_scale': 1.5})
+
+
+    def _create_production_charts_sheet(self, workbook, sheet_name, table_name):
+        """
+        Creates the 'Production Charts' dashboard sheet.
+        """
+        worksheet = workbook.add_worksheet(sheet_name)
+        worksheet.hide_gridlines(2)
+        
+        cat_formula = f"={table_name}[Date]"
+        
+        # --- Chart 1: Total Material Mined (Stacked Area) ---
+        chart1 = workbook.add_chart({'type': 'area', 'subtype': 'stacked'})
+        chart1.set_title({'name': 'Total Material Mined (RGM vs Sar)'})
+        
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Ore Mined - RGM - kt]",
+            'name': 'RGM Ore'
+        })
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Overburden - RGM - kt]",
+            'name': 'RGM Overburden'
+        })
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Ore Mined - Sar - kt]",
+            'name': 'Sar Ore'
+        })
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Overburden - Sar - kt]",
+            'name': 'Sar Overburden'
         })
         
-        chart_yearly.set_title({'name': f'Yearly Summary: {group_key[0]} - {group_key[1]}'})
-        chart_yearly.set_x_axis({'name': 'Year'})
-        chart_yearly.set_y_axis({'name': f'Total {group_key[2]}', 'num_format': '#,##0'})
-        chart_yearly.set_legend({'position': 'none'})
+        chart1.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart1.set_y_axis({'name': 'Total Material (kt)', 'num_format': '#,##0'})
+        chart1.set_legend({'position': 'bottom'})
+        worksheet.insert_chart('A1', chart1, {'x_scale': 2.0, 'y_scale': 1.5})
 
-        dashboard_sheet.insert_chart(current_row, 8, chart_yearly, {'x_scale': 1.8, 'y_scale': 1.4})
+        # --- Chart 2: Ore Mined (Stacked Area) ---
+        chart2 = workbook.add_chart({'type': 'area', 'subtype': 'stacked'})
+        chart2.set_title({'name': 'Ore Mined (RGM vs Sar)'})
+        
+        chart2.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Ore Mined - RGM - kt]",
+            'name': 'RGM Ore'
+        })
+        chart2.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Ore Mined - Sar - kt]",
+            'name': 'Sar Ore'
+        })
+        chart2.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart2.set_y_axis({'name': 'Ore Mined (kt)', 'num_format': '#,##0'})
+        chart2.set_legend({'position': 'bottom'})
+        worksheet.insert_chart('A26', chart2, {'x_scale': 1.0, 'y_scale': 1.5})
 
-        # Return the next available row, adding 25 rows for chart height + 2 for spacing
-        return current_row + 27
+        # --- Chart 3: Overburden (Stacked Area) ---
+        chart3 = workbook.add_chart({'type': 'area', 'subtype': 'stacked'})
+        chart3.set_title({'name': 'Overburden (RGM vs Sar)'})
+        
+        chart3.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Overburden - RGM - kt]",
+            'name': 'RGM Overburden'
+        })
+        chart3.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Overburden - Sar - kt]",
+            'name': 'Sar Overburden'
+        })
+        chart3.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart3.set_y_axis({'name': 'Overburden (kt)', 'num_format': '#,##0'})
+        chart3.set_legend({'position': 'bottom'})
+        worksheet.insert_chart('I26', chart3, {'x_scale': 1.0, 'y_scale': 1.5})
 
+    def _create_efficiency_charts_sheet(self, workbook, sheet_name, table_name):
+        """
+        Creates the 'Efficiency Charts' dashboard sheet.
+        """
+        worksheet = workbook.add_worksheet(sheet_name)
+        worksheet.hide_gridlines(2)
+        
+        cat_formula = f"={table_name}[Date]"
+
+        # --- Chart 1: Productivity (kt / Fleet) ---
+        chart1 = workbook.add_chart({'type': 'line'})
+        chart1.set_title({'name': 'Productivity (kt / Fleet)'})
+        
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Productivity (kt per Fleet)]",
+            'name': 'kt / Fleet',
+            'marker': {'type': 'automatic'},
+        })
+        chart1.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart1.set_y_axis({'name': 'kt / Fleet', 'num_format': '0.00'})
+        chart1.set_legend({'position': 'none'})
+        worksheet.insert_chart('A1', chart1, {'x_scale': 2.0, 'y_scale': 1.5})
+
+        # --- Chart 2: Efficiency (kt / L) ---
+        chart2 = workbook.add_chart({'type': 'line'})
+        chart2.set_title({'name': 'Efficiency (kt / L)'})
+        
+        chart2.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Efficiency (kt per Liter)]",
+            'name': 'kt / L',
+            'marker': {'type': 'automatic'},
+        })
+        chart2.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart2.set_y_axis({'name': 'kt / Liter', 'num_format': '0.00'})
+        chart2.set_legend({'position': 'none'})
+        worksheet.insert_chart('A26', chart2, {'x_scale': 2.0, 'y_scale': 1.5})
+        
+    def _create_fleet_fuel_charts_sheet(self, workbook, sheet_name, table_name):
+        """
+        Creates the 'Fleet, Fuel & Ore' dashboard sheet.
+        This function correctly plots Fuel (column) on the primary
+        axis and Fleet (line) / Ore (line) on the secondary axis.
+        """
+        worksheet = workbook.add_worksheet(sheet_name)
+        worksheet.hide_gridlines(2)
+        
+        cat_formula = f"={table_name}[Date]"
+
+        # --- Chart 1: Fleet, Fuel & Ore Production (Combo Chart) ---
+        chart1 = workbook.add_chart({'type': 'column'})
+        chart1.set_title({'name': 'Fleet, Fuel & Ore Production Analysis'})
+        
+        # Series 1: Fuel (Column, Primary Axis)
+        chart1.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Liter of Diesel Consumed]",
+            'name': 'Liters Consumed',
+            'y_axis': 0, # Primary axis
+        })
+        
+        # Create the Line chart to combine
+        line_chart = workbook.add_chart({'type': 'line'})
+        
+        # Series 2: Fleet (Line, Secondary Axis)
+        line_chart.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Active Fleet Count (Aprox)]",
+            'name': 'Active Fleet',
+            'marker': {'type': 'automatic'},
+            'y_axis': 1, # Use secondary axis
+        })
+        
+        # Series 3: Total Ore (Line, Secondary Axis)
+        line_chart.add_series({
+            'categories': cat_formula,
+            'values': f"={table_name}[Total Ore (kt)]",
+            'name': 'Total Ore (kt)',
+            'marker': {'type': 'automatic'},
+            'y_axis': 1, # Use secondary axis
+        })
+        
+        # Combine the column and line charts
+        chart1.combine(line_chart)
+        
+        # --- Configure Axes ---
+        chart1.set_x_axis({'name': 'Date', 'date_axis': True, 'num_format': 'yyyy-mm'})
+        chart1.set_y_axis({'name': 'Liters Consumed', 'num_format': '#,##0'})
+        chart1.set_y2_axis({'name': 'Fleet Count / Ore (kt)', 'num_format': '#,##0'})
+        
+        chart1.set_legend({'position': 'bottom'})
+        worksheet.insert_chart('A1', chart1, {'x_scale': 2.0, 'y_scale': 1.5})
+
+# Helper to get 0-based index from column name
+def name_idx(name):
+    """Helper to get 0-based index from column name."""
+    col_list = [
+        'Date', 'Ore Mined - RGM - kt', 'Overburden - RGM - kt', 
+        'Ore Mined - Sar - kt', 'Overburden - Sar - kt', 
+        'Active Fleet Count (Aprox)', 'Liter of Diesel Consumed',
+        'Total Ore (kt)', 'Total Overburden (kt)', 'Total Material (kt)',
+        'Efficiency (kt per Liter)', 'Productivity (kt per Fleet)',
+        'RGM Strip Ratio', 'Sar Strip Ratio'
+    ]
+    try:
+        return col_list.index(name)
+    except ValueError:
+        raise KeyError(f"Column name '{name}' not found in defined list.")

@@ -4,12 +4,14 @@ Filepath: kts_analyzer/services/data_service.py
 KTS Analyzer - Data Service (VCSM)
 
 **Refactored**
-- **CRITICAL FIX:** Added .str.strip() to 'Category', 'SubCategory',
-  and 'Unit' columns after loading. This removes leading/trailing
-  whitespace that was causing KeyError (e.g., 'Liter of Diesel Consumed ').
-- Replaced empty strings ('') with pd.NA to ensure they are
-  filtered out when creating metric names.
-- Retained all previous logic for analysis.
+- In alignment with the new "Excel-first formula" architecture,
+  `get_analysis_dataframe` has been simplified.
+- It NO LONGER calculates any derived metrics (Total Material,
+  Efficiency, etc.).
+- Its sole responsibility is now to pivot the clean, long-format
+  data into a wide-format DataFrame.
+- All calculation logic is being moved to the ReportService,
+  which will write Excel formulas.
 ----------------------------------
 """
 
@@ -101,7 +103,6 @@ class MiningDataService:
         }, inplace=True)
 
         # --- FIX: Clean whitespace from ID columns ---
-        # This prevents KeyErrors when looking up 'Liter of Diesel Consumed'
         for col in ['Category', 'SubCategory', 'Unit']:
             if col in df_long.columns:
                 df_long[col] = df_long[col].astype(str).str.strip()
@@ -114,25 +115,10 @@ class MiningDataService:
 
         return df_long
 
-    def get_data_groups(self, df: pd.DataFrame) -> pd.api.typing.DataFrameGroupBy:
-        """
-        Groups the prepared DataFrame by the identifier columns.
-        
-        Args:
-            df: The prepared DataFrame from load_and_prepare_data.
-            
-        Returns:
-            A DataFrameGroupBy object.
-        """
-        if df.empty:
-            return pd.DataFrame().groupby(lambda: True) 
-            
-        return df.groupby(['Category', 'SubCategory', 'Unit'])
-
     def get_analysis_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Creates a wide-format DataFrame for correlation analysis
-        and calculates key derived metrics.
+        Creates a wide-format DataFrame for correlation analysis.
+        This service no longer calculates derived metrics.
         
         Args:
             df: The long-format DataFrame from load_and_prepare_data.
@@ -147,7 +133,6 @@ class MiningDataService:
         # or "Active Fleet Count (Aprox)"
         df_copy = df.copy()
         
-        # Now that data is cleaned, this filter is robust
         df_copy['MetricName'] = df_copy.apply(
             lambda row: " - ".join(
                 filter(pd.notna, [row['Category'], row['SubCategory'], row['Unit']])
@@ -162,44 +147,43 @@ class MiningDataService:
             values='Value'
         )
         
-        # --- Calculate Derived Metrics for Analysis ---
+        # Re-order columns to a logical format
+        # This is a bit manual but ensures a predictable layout for formulas
+        ordered_cols = [
+            'Ore Mined - RGM - kt',
+            'Overburden - RGM - kt',
+            'Ore Mined - Sar - kt',
+            'Overburden - Sar - kt',
+            'Active Fleet Count (Aprox)',
+            'Liter of Diesel Consumed'
+        ]
         
-        try:
-            # Sum all 'Ore Mined' columns
-            ore_cols = [c for c in analysis_df.columns if 'Ore Mined' in c]
-            if ore_cols:
-                analysis_df['Total Ore Mined (kt)'] = analysis_df[ore_cols].sum(axis=1)
-            
-            # Sum all 'Overburden' columns
-            overburden_cols = [c for c in analysis_df.columns if 'Overburden' in c]
-            if overburden_cols:
-                analysis_df['Total Overburden (kt)'] = analysis_df[overburden_cols].sum(axis=1)
-            
-            # Create 'Total Material (kt)'
-            total_material_cols = [c for c in ['Total Ore Mined (kt)', 'Total Overburden (kt)'] if c in analysis_df.columns]
-            if total_material_cols:
-                 analysis_df['Total Material (kt)'] = analysis_df[total_material_cols].sum(axis=1)
-            
-            # Define key metric columns
-            fleet_col = 'Active Fleet Count (Aprox)'
-            fuel_col = 'Liter of Diesel Consumed' # This key will now be found
-            material_col = 'Total Material (kt)'
-
-            # Calculate Efficiency (kt per Liter)
-            if material_col in analysis_df.columns and fuel_col in analysis_df.columns:
-                # Use .replace(0, pd.NA) to avoid ZeroDivisionError
-                analysis_df['Efficiency (kt per Liter)'] = \
-                    analysis_df[material_col] / analysis_df[fuel_col].replace(0, pd.NA)
-            
-            # Calculate Productivity (kt per Fleet)
-            if material_col in analysis_df.columns and fleet_col in analysis_df.columns:
-                analysis_df['Productivity (kt per Fleet)'] = \
-                    analysis_df[material_col] / analysis_df[fleet_col].replace(0, pd.NA)
-
-        except KeyError as e:
-            print(f"Warning: Could not calculate derived metric. Missing column: {e}")
-        except Exception as e:
-            print(f"Warning: Error calculating derived metrics: {e}")
+        # Filter for columns that actually exist in the data
+        final_cols = [col for col in ordered_cols if col in analysis_df.columns]
+        # Add any extra columns that weren't in the preferred list
+        extra_cols = [col for col in analysis_df.columns if col not in final_cols]
+        
+        analysis_df = analysis_df[final_cols + extra_cols]
 
         return analysis_df
+
+    # -----------------------------------------------------------------
+    # --- DEPRECATED METHODS ---
+    # These functions are no longer needed, as the new architecture
+    # does not create individual metric sheets or Python-based summaries.
+    # -----------------------------------------------------------------
+
+    def get_data_groups(self, df: pd.DataFrame):
+        """
+        DEPRECATED: This method is no longer used by the controller.
+        """
+        print("Warning: get_data_groups() is deprecated.")
+        return pd.DataFrame().groupby(lambda: True) 
+
+    def summarize_data(self, df_groups: pd.api.typing.DataFrameGroupBy) -> pd.DataFrame:
+        """
+        DEPRECATED: This method is no longer used by the controller.
+        """
+        print("Warning: summarize_data() is deprecated.")
+        return pd.DataFrame()
 
